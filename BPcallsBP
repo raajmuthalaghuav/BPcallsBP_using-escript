@@ -1,0 +1,159 @@
+Hey Charan,
+    Something to share with you. Rest api call to MPI on powershell helped to create BP call from escript.
+
+For Icici project, BP call using escript have implemented avoid dependency of existing machine(if PS script, needs a existing machine).
+	a. This script will launch a blueprint with customization like: One windows blueprint enough to provision DB/APP/WEB. Depends on selection, softwares get installed.
+	b. multiple OS version in single bp by overriding templates.
+	c. resources like cpu, ram set as per tshirt sizing.
+
+
+RESTAPIServer = "@@{CalmIP}@@"
+RESTAPIUser = '@@{CalmServer.username}@@'
+RESTAPIPassword = '@@{CalmServer.secret}@@'
+
+if "@@{OS}@@" == "Windows":
+    BPname = "NTNX_Windows"
+
+if "@@{OS}@@" == "RHEL":
+    BPname = "NTNX_RHEL"
+
+    
+AppProfile = "JPR_CORP_WIN_2016" 
+AppName = "CORE_@@{calm_application_name}@@"
+
+
+headers = {'Content-type': 'application/json','Accept': 'application/json'}
+BaseURL = 'https://{0}:9440/api/nutanix/v3/'.format('@@{CalmIP}@@')
+
+
+def setconfig(api_url, verb, payload):
+  r = urlreq(api_url, verb=verb, auth="BASIC", user='@@{CalmServer.username}@@', passwd='@@{CalmServer.secret}@@', headers={'Content-type': 'application/json','Accept': 'application/json'}, params=json.dumps(payload), verify=False)
+  if r.ok:
+    resp = json.loads(r.content)
+    return resp
+  else:
+    print "Rest api request failed", r.content
+    exit(1)
+
+    
+#Get the BP uuid from BP name
+payload = {"kind":"blueprint", "offset":0, "length":250}
+url = BaseURL + 'blueprints/list'
+payload = setconfig(api_url=url, verb='POST', payload=payload)
+
+bp_uuid = None
+for i in payload['entities']:
+    if i['status']['name'] == BPname and i['status']['state'] == 'ACTIVE':
+        bp_uuid = str(i['status']['uuid'])
+
+if not bp_uuid:
+    print "No BP with that name in active state"
+    exit(1)
+
+#Get BP resource and app profile
+payload = {}
+url = BaseURL + 'blueprints/' + bp_uuid
+payload = setconfig(api_url=url, verb='GET', payload=payload)
+
+app_profile_uuid=None
+for i in payload['spec']['resources']['app_profile_list']:
+    if i['name'] == AppProfile:
+        app_profile_uuid = str(i['uuid'])
+
+if not app_profile_uuid:
+    print "No App profile with given name"
+    exit(1)
+
+#Get run time variables
+payload = {}
+url = BaseURL + 'blueprints/' + bp_uuid + '/runtime_editables?app_profile_uuid=' + app_profile_uuid + "&app_profile_name=" + AppProfile
+payload = setconfig(api_url=url, verb='GET', payload=payload)
+
+for i in payload['resources']:
+    if i['app_profile_reference']['name'] == AppProfile:
+        app_profile_reference = i['app_profile_reference']
+        run_editables = i['runtime_editables']
+    
+#set values to input variables
+for i in run_editables['variable_list']:
+    if i['name'] == 'IP_ADDRESS':
+        i['value']['value'] = '@@{IP_ADDRESS}@@'
+    if i['name'] == 'VMNAME':
+        i['value']['value'] = '@@{calm_application_name}@@'
+    if i['name'] == 'APP':
+        i['value']['value'] = '@@{APP}@@'
+
+if "@@{COMPUTE}@@" == 'SMALL':
+  run_editables['substrate_list'][0]['value']['spec']['resources']['num_sockets'] = 2
+  run_editables['substrate_list'][0]['value']['spec']['resources']['memory_size_mib'] = 4096
+if "@@{COMPUTE}@@" == 'MEDIUM':
+  run_editables['substrate_list'][0]['value']['spec']['resources']['num_sockets'] = 4
+  run_editables['substrate_list'][0]['value']['spec']['resources']['memory_size_mib'] = 8192
+if "@@{COMPUTE}@@" == 'LARGE':
+  run_editables['substrate_list'][0]['value']['spec']['resources']['num_sockets'] = 8
+  run_editables['substrate_list'][0]['value']['spec']['resources']['memory_size_mib'] = 16384
+        
+#image override
+run_editables['substrate_list'][0]['value']['spec']['resources']['disk_list']['0']['data_source_reference']['name'] = "Image name"
+run_editables['substrate_list'][0]['value']['spec']['resources']['disk_list']['0']['data_source_reference']['uuid'] = "Image UUID"
+
+
+#generate spec
+payload = {
+    "spec": {
+        "app_name": AppName,
+        "app_description": AppName,
+        "app_profile_reference": app_profile_reference,
+        "runtime_editables": {
+            "substrate_list": run_editables['substrate_list'],
+            "variable_list": run_editables['variable_list']
+             }
+      
+        }
+}
+
+# simple launch bp
+url = BaseURL + 'blueprints/' + bp_uuid + '/simple_launch'
+payload = setconfig(api_url=url, verb='POST', payload=payload)
+request_id=payload['status']['request_id']
+
+
+#------------------- get launch status and app status
+url = BaseURL + 'blueprints/' + bp_uuid +"/pending_launches/" + str(request_id)
+
+while True:
+    payload={}
+    payload = setconfig(api_url=url, verb='GET', payload=payload)
+
+    launch_state=payload['status']['state']
+    if launch_state == 'success':
+        print "App request is successfull"
+        app_uuid=payload['status']['application_uuid']
+        break
+    elif launch_state == 'failed':
+        print "App request failed"
+        exit(1)
+        break
+    print "Waiting 10s for App to provision..."
+    sleep(10)
+
+
+url = BaseURL + 'apps/' + str(app_uuid)
+
+while True:
+    payload={}
+    payload = setconfig(api_url=url, verb='GET', payload=payload)
+
+    app_state=payload['status']['state']
+    if app_state == 'running':
+        print "App Request is successfully placed."
+        break
+    elif app_state == 'error' or app_state == 'failed':
+        print "App launch failed"
+        exit(1)
+        break
+    print "App is in provisioning state....."
+    sleep(10)
+
+
+
